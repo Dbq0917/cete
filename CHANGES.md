@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [Unreleased]
 
+- Add vector-clock versioning to stored values and reconciliation with automatic conflict detection, so replicas that diverged during a network partition converge without manual comparison; only genuinely concurrent writes are reported as conflicts
 - Fix go.mod dependency due to a change in the case #50 @mosuka
 - Add garbage collector for badger #48 @christian-roggia
 - adds cicd #41 @vniche

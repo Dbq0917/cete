@@ -27,14 +27,14 @@ type RaftFSM struct {
 	applyCh chan *protobuf.Event
 }
 
-func NewRaftFSM(path string, logger *zap.Logger) (*RaftFSM, error) {
+func NewRaftFSM(path string, nodeID string, logger *zap.Logger) (*RaftFSM, error) {
 	err := os.MkdirAll(path, 0755)
 	if err != nil && !os.IsExist(err) {
 		logger.Error("failed to make directories", zap.String("path", path), zap.Error(err))
 		return nil, err
 	}
 
-	kvs, err := storage.NewKVS(path, path, logger)
+	kvs, err := storage.NewKVS(path, path, nodeID, logger)
 	if err != nil {
 		logger.Error("failed to create key value store", zap.String("path", path), zap.Error(err))
 		return nil, err
@@ -84,6 +84,18 @@ func (f *RaftFSM) Scan(prefix string) ([][]byte, error) {
 	}
 
 	return values, nil
+}
+
+// VersionedItems exports every key with its version for reconciliation with
+// another replica after a partition heals.
+func (f *RaftFSM) VersionedItems() <-chan *storage.VersionedKeyValue {
+	return f.kvs.VersionedItems()
+}
+
+// Reconcile merges versioned items received from another replica and returns
+// the genuine conflicts that were detected and automatically resolved.
+func (f *RaftFSM) Reconcile(items <-chan *storage.VersionedKeyValue) []*storage.Conflict {
+	return f.kvs.Reconcile(items)
 }
 
 func (f *RaftFSM) applySet(key string, value []byte) interface{} {
@@ -280,8 +292,8 @@ func (f *RaftFSM) Restore(rc io.ReadCloser) error {
 			return err
 		}
 
-		// apply item to store
-		err = f.kvs.Set(kvp.Key, kvp.Value)
+		// apply item to store, preserving the version carried by the snapshot
+		err = f.kvs.SetRaw(kvp.Key, kvp.Value)
 		if err != nil {
 			f.logger.Error("failed to set key value pair to key value store", zap.Error(err))
 			return err

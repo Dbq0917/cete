@@ -41,7 +41,7 @@ type RaftServer struct {
 
 func NewRaftServer(id string, raftAddress string, dataDirectory string, bootstrap bool, logger *zap.Logger) (*RaftServer, error) {
 	fsmPath := filepath.Join(dataDirectory, "kvs")
-	fsm, err := NewRaftFSM(fsmPath, logger)
+	fsm, err := NewRaftFSM(fsmPath, id, logger)
 	if err != nil {
 		logger.Error("failed to create FSM", zap.String("path", fsmPath), zap.Error(err))
 		return nil, err
