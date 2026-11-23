@@ -33,6 +33,8 @@ type GRPCService struct {
 	watchClusterDoneCh chan struct{}
 }
 
+const readBarrierTimeout = 10 * time.Second
+
 func NewGRPCService(raftServer *RaftServer, certificateFile string, commonName string, logger *zap.Logger) (*GRPCService, error) {
 	return &GRPCService{
 		raftServer:      raftServer,
@@ -47,6 +49,67 @@ func NewGRPCService(raftServer *RaftServer, certificateFile string, commonName s
 		watchClusterStopCh: make(chan struct{}),
 		watchClusterDoneCh: make(chan struct{}),
 	}, nil
+}
+
+func (s *GRPCService) peerClient(id string, grpcAddress string) (*client.GRPCClient, error) {
+	s.watchMutex.RLock()
+	existing := s.peerClients[id]
+	s.watchMutex.RUnlock()
+
+	if existing != nil && existing.Target() == grpcAddress {
+		return existing, nil
+	}
+
+	newClient, err := client.NewGRPCClientWithContextTLS(grpcAddress, context.TODO(), s.certificateFile, s.commonName)
+	if err != nil {
+		return nil, err
+	}
+
+	s.watchMutex.Lock()
+	defer s.watchMutex.Unlock()
+
+	if existing = s.peerClients[id]; existing != nil && existing.Target() == grpcAddress {
+		_ = newClient.Close()
+		return existing, nil
+	}
+
+	if existing != nil {
+		_ = existing.Close()
+	}
+	s.peerClients[id] = newClient
+
+	return newClient, nil
+}
+
+func (s *GRPCService) leaderClient(timeout time.Duration) (*client.GRPCClient, error) {
+	deadline := time.Now().Add(timeout)
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, errors.ErrNotFoundLeader
+		}
+
+		leaderID, err := s.raftServer.LeaderID(remaining)
+		if err != nil {
+			return nil, err
+		}
+		if string(leaderID) == s.raftServer.id {
+			return nil, errors.ErrNotFoundLeader
+		}
+
+		nodes, err := s.raftServer.Nodes()
+		if err != nil {
+			return nil, err
+		}
+
+		node, exists := nodes[string(leaderID)]
+		if exists && node.Metadata != nil && node.Metadata.GrpcAddress != "" {
+			return s.peerClient(string(leaderID), node.Metadata.GrpcAddress)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func (s *GRPCService) Start() error {
@@ -332,9 +395,51 @@ func (s *GRPCService) Snapshot(ctx context.Context, req *empty.Empty) (*empty.Em
 func (s *GRPCService) Get(ctx context.Context, req *protobuf.GetRequest) (*protobuf.GetResponse, error) {
 	resp := &protobuf.GetResponse{}
 
-	var err error
+	if s.raftServer.State() != raft.Leader {
+		c, err := s.leaderClient(readBarrierTimeout)
+		if err != nil {
+			s.logger.Error("failed to find leader", zap.String("key", req.Key), zap.Error(err))
+			return resp, status.Error(codes.Internal, err.Error())
+		}
 
-	resp, err = s.raftServer.Get(req)
+		resp, err = c.Get(req)
+		if err != nil {
+			switch err {
+			case errors.ErrNotFound:
+				s.logger.Debug("key not found", zap.String("key", req.Key), zap.String("err", err.Error()))
+				return resp, status.Error(codes.NotFound, err.Error())
+			default:
+				s.logger.Debug("failed to get data from leader", zap.String("key", req.Key), zap.String("err", err.Error()))
+				return resp, status.Error(codes.Internal, err.Error())
+			}
+		}
+
+		return resp, nil
+	}
+
+	if err := s.raftServer.ReadBarrier(readBarrierTimeout); err != nil {
+		if s.raftServer.State() != raft.Leader {
+			c, leaderErr := s.leaderClient(readBarrierTimeout)
+			if leaderErr != nil {
+				s.logger.Debug("failed to find leader", zap.String("key", req.Key), zap.Error(leaderErr))
+				return resp, status.Error(codes.Internal, leaderErr.Error())
+			}
+
+			resp, leaderErr = c.Get(req)
+			if leaderErr == nil {
+				return resp, nil
+			}
+			if leaderErr == errors.ErrNotFound {
+				return resp, status.Error(codes.NotFound, leaderErr.Error())
+			}
+			err = leaderErr
+		}
+
+		s.logger.Debug("failed to apply read barrier", zap.String("key", req.Key), zap.String("err", err.Error()))
+		return resp, status.Error(codes.Internal, err.Error())
+	}
+
+	resp, err := s.raftServer.Get(req)
 	if err != nil {
 		switch err {
 		case errors.ErrNotFound:
@@ -352,9 +457,39 @@ func (s *GRPCService) Get(ctx context.Context, req *protobuf.GetRequest) (*proto
 func (s *GRPCService) Scan(ctx context.Context, req *protobuf.ScanRequest) (*protobuf.ScanResponse, error) {
 	resp := &protobuf.ScanResponse{}
 
-	var err error
+	if s.raftServer.State() != raft.Leader {
+		c, err := s.leaderClient(readBarrierTimeout)
+		if err != nil {
+			s.logger.Error("failed to find leader", zap.String("prefix", req.Prefix), zap.Error(err))
+			return resp, status.Error(codes.Internal, err.Error())
+		}
 
-	resp, err = s.raftServer.Scan(req)
+		resp, err = c.Scan(req)
+		if err != nil {
+			s.logger.Debug("failed to scan data from leader", zap.String("prefix", req.Prefix), zap.String("err", err.Error()))
+			return resp, status.Error(codes.Internal, err.Error())
+		}
+
+		return resp, nil
+	}
+
+	if err := s.raftServer.ReadBarrier(readBarrierTimeout); err != nil {
+		if s.raftServer.State() != raft.Leader {
+			c, leaderErr := s.leaderClient(readBarrierTimeout)
+			if leaderErr == nil {
+				resp, leaderErr = c.Scan(req)
+				if leaderErr == nil {
+					return resp, nil
+				}
+			}
+			err = leaderErr
+		}
+
+		s.logger.Debug("failed to apply read barrier", zap.String("prefix", req.Prefix), zap.String("err", err.Error()))
+		return resp, status.Error(codes.Internal, err.Error())
+	}
+
+	resp, err := s.raftServer.Scan(req)
 	if err != nil {
 		switch err {
 		default:
@@ -370,13 +505,12 @@ func (s *GRPCService) Set(ctx context.Context, req *protobuf.SetRequest) (*empty
 	resp := &empty.Empty{}
 
 	if s.raftServer.raft.State() != raft.Leader {
-		clusterResp, err := s.Cluster(ctx, &empty.Empty{})
+		c, err := s.leaderClient(readBarrierTimeout)
 		if err != nil {
-			s.logger.Error("failed to get cluster info", zap.Error(err))
+			s.logger.Error("failed to find leader", zap.Error(err))
 			return resp, status.Error(codes.Internal, err.Error())
 		}
 
-		c := s.peerClients[clusterResp.Cluster.Leader]
 		err = c.Set(req)
 		if err != nil {
 			s.logger.Error("failed to forward request", zap.String("grpc_address", c.Target()), zap.Error(err))
@@ -399,13 +533,12 @@ func (s *GRPCService) Delete(ctx context.Context, req *protobuf.DeleteRequest) (
 	resp := &empty.Empty{}
 
 	if s.raftServer.raft.State() != raft.Leader {
-		clusterResp, err := s.Cluster(ctx, &empty.Empty{})
+		c, err := s.leaderClient(readBarrierTimeout)
 		if err != nil {
-			s.logger.Error("failed to get cluster info", zap.Error(err))
+			s.logger.Error("failed to find leader", zap.Error(err))
 			return resp, status.Error(codes.Internal, err.Error())
 		}
 
-		c := s.peerClients[clusterResp.Cluster.Leader]
 		err = c.Delete(req)
 		if err != nil {
 			s.logger.Error("failed to forward request", zap.String("grpc_address", c.Target()), zap.Error(err))

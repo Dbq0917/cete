@@ -347,6 +347,10 @@ func (s *RaftServer) stopWatchCluster() {
 }
 
 func (s *RaftServer) LeaderAddress(timeout time.Duration) (raft.ServerAddress, error) {
+	if leaderAddr := s.raft.Leader(); leaderAddr != "" {
+		return leaderAddr, nil
+	}
+
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	timer := time.NewTimer(timeout)
@@ -592,6 +596,21 @@ func (s *RaftServer) Snapshot() error {
 	return nil
 }
 
+// ReadBarrier waits until every write that was committed before this call has
+// been applied to the local FSM. It must only be used on the leader.
+func (s *RaftServer) ReadBarrier(timeout time.Duration) error {
+	if s.State() != raft.Leader {
+		return errors.ErrNotFoundLeader
+	}
+
+	if err := s.raft.Barrier(timeout).Error(); err != nil {
+		s.logger.Error("failed to apply read barrier", zap.Error(err))
+		return err
+	}
+
+	return nil
+}
+
 func (s *RaftServer) Get(req *protobuf.GetRequest) (*protobuf.GetResponse, error) {
 	value, err := s.fsm.Get(req.Key)
 	if err != nil {
@@ -638,6 +657,8 @@ func (s *RaftServer) Set(req *protobuf.SetRequest) error {
 		return err
 	}
 
+	// Apply returns after Raft commits the command on a majority of voters and
+	// applies it to the leader's FSM; slower followers are not on the hot path.
 	if future := s.raft.Apply(msg, 10*time.Second); future.Error() != nil {
 		s.logger.Error("failed to apply the message", zap.Error(future.Error()))
 		return future.Error()

@@ -107,6 +107,9 @@ func (f *RaftFSM) applyDelete(key string) interface{} {
 }
 
 func (f *RaftFSM) getMetadata(id string) *protobuf.Metadata {
+	f.nodesMutex.RLock()
+	defer f.nodesMutex.RUnlock()
+
 	if metadata, exists := f.metadata[id]; exists {
 		return metadata
 	} else {

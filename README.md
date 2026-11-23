@@ -16,6 +16,11 @@ Cete makes it easy bringing up a cluster of BadgerDB (a cete of badgers) .
 - Docker container image is available
 
 
+## Consistency
+
+Cete commits writes after a majority of Raft voters have acknowledged them, so a slow or unavailable follower does not add latency to the write path. Reads are forwarded to the leader and use a Raft read barrier before accessing the local store, which prevents returning a replica that has not applied a committed write yet.
+
+
 ## Building Cete
 
 When you satisfied dependencies, let's build Cete for Linux as following:

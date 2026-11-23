@@ -157,6 +157,14 @@ func (c *GRPCClient) Get(req *protobuf.GetRequest, opts ...grpc.CallOption) (*pr
 	}
 }
 
+func (c *GRPCClient) Scan(req *protobuf.ScanRequest, opts ...grpc.CallOption) (*protobuf.ScanResponse, error) {
+	if resp, err := c.client.Scan(c.ctx, req, opts...); err != nil {
+		return nil, err
+	} else {
+		return resp, nil
+	}
+}
+
 func (c *GRPCClient) Set(req *protobuf.SetRequest, opts ...grpc.CallOption) error {
 	if _, err := c.client.Set(c.ctx, req, opts...); err != nil {
 		return err
